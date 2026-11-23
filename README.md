@@ -8,6 +8,9 @@ cards, CDs and DVDs, and external hard drives. For the kinds of drives you choos
   label, and its autorun.inf icon or the first icon file in its root.
 - **starts autorun.inf programs** as a disk goes in, as AutoRun did before Windows limited it to CDs and DVDs.
 - **turns off Windows' AutoPlay** while it runs, so that AutoPlay and RetroRun don't both act on a disc.
+- **renames shortcuts to drives after the drives**, if you ask it to: a shortcut on the desktop to a drive takes
+  the drive's name as File Explorer shows it, with the disk's name in it, and the drive's icon, in place of its own
+  name, such as "Floppy Disk Drive (A) - Shortcut".
 
 It runs as the current user, needs no administrator rights, and needs Windows 10 or 11.
 
@@ -22,6 +25,8 @@ It runs as the current user, needs no administrator rights, and needs Windows 10
 | Display autorun.inf label | Shows the label that the disk's autorun.inf names |
 | Display first icon on disk (no autorun.inf) | Shows the first `.ico` file in the disk's root when no autorun.inf icon is shown |
 | Display volume label (no autorun.inf label) | Shows the volume label when no autorun.inf label is shown |
+| Update shortcuts to drives | Renames shortcuts to drives on the desktop after their drives, as Explorer names the drives, and gives them the drives' icons; off at first |
+| Drive letters in shortcut names | Names the shortcuts with their drives' letters, as "TESTDISK (A꞉)", or, unticked, without them, as "TESTDISK" |
 | Launch autorun.inf applications (submenu) | The kinds of drives whose autorun.inf programs are started |
 | Disable native AutoPlay handling (submenu) | The kinds of drives that Windows' AutoPlay is kept from acting on |
 | Look for disks (submenu) | The kinds of drives that are asked every 2 seconds whether a disk is in; all at first |
@@ -70,6 +75,30 @@ neither asks what to do nor does anything, and doesn't start a disc's program ei
 RetroRun exits. Explorer still reads discs itself, for their autorun.inf icon and label, and no per-user setting
 changes that.
 
+## Shortcuts to drives
+
+With **Update shortcuts to drives** ticked, each shortcut on the desktop to the root of a drive whose disks' names
+and icons are shown is renamed after its drive, as File Explorer names the drive, and given the drive's icon:
+"Floppy Disk Drive (A꞉)", say, and "TESTDISK (A꞉)" while a disk labelled TESTDISK is in. Its name and icon follow
+the disks as they go in and out.
+
+- A file's name cannot hold a colon, so the drive's letter is followed by `꞉` (U+A789), which looks like one. Untick
+  **Drive letters in shortcut names** for names without the letter, such as "TESTDISK". A program that reads file
+  names only in the ANSI code page, as Windows Script Host does, cannot open a shortcut whose name holds `꞉`.
+- The drive's icon becomes the shortcut's own, so that Explorer takes it from the shortcut rather than from the
+  drive.
+- Each shortcut gets its own name and icon back when the item is unticked, when its drive goes, when RetroRun
+  exits, and as RetroRun starts after it ended without that. If another file has taken the shortcut's name
+  meanwhile, it gets "(2)" after it, as Windows does.
+- A shortcut that someone renames while the item is ticked is renamed after its drive again, and still gets its
+  own name from before back.
+- Shortcuts on the desktop of all users, in the Public Desktop folder, are left alone: renaming them would need
+  administrator rights.
+
+RetroRun keeps each shortcut's own name and icon under `HKCU\Software\RetroRun\ShortcutNames`, by the identity of
+the shortcut's file, which holds however the file is renamed. It renames the shortcuts because Explorer shows a
+rename at once, while the names that a folder's `desktop.ini` can give files it reads only once as long as it runs.
+
 ## How disks are noticed
 
 Drives are recognized by their devices, whatever their letters; SuperDisk drives by their model (LS-120 or
@@ -92,9 +121,11 @@ by another program until it is let go.
 
 The settings are DWORD values under `HKCU\Software\RetroRun`, which the menu writes. `Display`, `Launch`,
 `Native` and `Look` hold the ticked kinds of drives as bits: 1 floppy disk drives, 2 SuperDisk drives, 4 USB
-drives, 8 memory cards, 16 other removable disks, 32 CD and DVD drives, 64 external hard drives. Two settings
-have no menu item: `CheckMs`, how often drives are asked whether a disk is in (2000 milliseconds, at least 500),
-and `RefreshAll` (0 or 1), which has Explorer redraw every icon instead of only the drive's.
+drives, 8 memory cards, 16 other removable disks, 32 CD and DVD drives, 64 external hard drives. `Shortcuts` is 1
+while shortcuts to drives are updated, and `ShortcutLetters` 0 while their names leave the drives' letters out. Three settings have no menu item: `CheckMs`, how often drives are asked
+whether a disk is in (2000 milliseconds, at least 500); `RefreshAll` (0 or 1), which has Explorer redraw every icon
+instead of only the drive's; and `ShortcutFolders`, a list of folders (`REG_MULTI_SZ`) whose shortcuts to drives are
+updated instead of the desktop's. RetroRun reads them as it starts.
 
 RetroRun's log is `%LOCALAPPDATA%\RetroRun\RetroRun.log`, started afresh when it grows past 512 KiB.
 
@@ -123,7 +154,8 @@ build, and configure with `cmake --preset vs2022 -A Win32` for 32-bit x86. Visua
 and build from the presets.
 
 The tests check how autorun.inf files are read, how their commands are split into a program and its parameters,
-and how drives are told apart by model. They start nothing.
+how drives are told apart by model, and how shortcuts to drives are found, named and given icons, in a temporary
+folder. They start nothing.
 
 ## Installing
 
@@ -131,5 +163,5 @@ There is no installer. Copy `RetroRun.exe` to a folder of your choice, such as `
 run it, and tick **Start with Windows** in its tray menu. `RetroRun.exe /exit` asks a running copy to exit.
 
 To remove it, untick **Start with Windows** and choose **Exit**; RetroRun takes its drive keys and its AutoPlay
-listing back as it exits. Then delete the program, the key `HKCU\Software\RetroRun` and the folder
+listing back as it exits, and gives shortcuts their own names and icons back. Then delete the program, the key `HKCU\Software\RetroRun` and the folder
 `%LOCALAPPDATA%\RetroRun`.

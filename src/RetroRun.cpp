@@ -1,5 +1,5 @@
 /*
- * RetroRun, a tray program for removable disks. It does three things, each for the kinds of drives chosen in its
+ * RetroRun, a tray program for removable disks. It does four things, each for the kinds of drives chosen in its
  * tray menu.
  *
  * 1. It shows disks' own names and icons in File Explorer where Explorer leaves them out. Explorer draws a floppy
@@ -30,6 +30,15 @@
  *    act: it neither asks what to do, nor does anything, nor starts a disc's program. Explorer still reads the
  *    disks itself, which no per-user setting changes.
  *
+ * 4. It names shortcuts to drives after their drives, if the menu asks it to. A shortcut on the desktop to a drive
+ *    whose disks' names and icons are shown (see 1) is renamed after the drive's name as Explorer gives it, the
+ *    disk's within it, in place of its own, such as "Floppy Disk Drive (A) - Shortcut": with the drive's letter,
+ *    whose colon the file's name holds as a look-alike, or without it, as the menu chooses. It is given its drive's
+ *    icon too, which Explorer then takes from the shortcut itself. Explorer shows a rename at once, where the names
+ *    a folder's desktop.ini gives files it reads only once while it runs. Each shortcut gets its own name and icon
+ *    back as the program ends, as its drive goes, and as the program starts after it ended without that: they are
+ *    kept by the shortcut file's identity, which holds however the file is renamed.
+ *
  * Drives are found by their devices, whatever their letters, and followed as they come and go: those of the kinds
  * the menu has something to do for. How a disk is noticed depends on the drive:
  * - A drive that describes itself, as SuperDisk, CD and other ATAPI and USB drives do, can tell from its own
@@ -47,6 +56,7 @@
 #include "drives.h"
 #include "inf.h"
 #include "launch.h"
+#include "shortcuts.h"
 #include <winioctl.h>
 #include <dbt.h>
 #include <shellapi.h>
@@ -79,9 +89,13 @@ const wchar_t kName[]        = L"RetroRun";
 /* The class under which the program registers with AutoPlay, and its name in the CancelAutoplay key. */
 const CLSID   kCancelClass   = { 0x6956C4D3, 0x3AE2, 0x48CA, { 0xB6, 0xF1, 0xA4, 0x38, 0x8C, 0x71, 0xEF, 0x93 } };
 const wchar_t kCancelValue[] = L"6956C4D3-3AE2-48CA-B6F1-A4388C71EF93";
+/* What the program keeps of the shortcuts it renamed, by their files' identities, so that it gives them their own
+   names and icons back even after it ended without that. */
+const wchar_t kNamed[]       = L"Software\\RetroRun\\ShortcutNames";
 
-constexpr UINT   kTrayMessage   = WM_APP + 1;
-constexpr UINT   kResultMessage = WM_APP + 2;
+constexpr UINT   kTrayMessage     = WM_APP + 1;
+constexpr UINT   kResultMessage   = WM_APP + 2;
+constexpr UINT   kShortcutMessage = WM_APP + 3;
 constexpr UINT   kTrayId        = 1;
 constexpr UINT   kTimerId       = 1;
 constexpr DWORD  kIconMax       = 8u << 20;  /* An icon file is read up to this size. */
@@ -105,6 +119,10 @@ constexpr UINT kRefreshGaps[] = { 1000, 2000 };
    broadcast: the drives are looked for again a second later. */
 constexpr UINT kScanTimer = 300;
 constexpr UINT kScanAgain = 1000;
+/* A change in a folder whose shortcuts are named comes as a burst of notifications, of the change and of what the
+   program and Explorer do about it: the folder's shortcuts are looked at again once the burst has settled. */
+constexpr UINT kShortcutTimer  = 400;
+constexpr UINT kShortcutSettle = 500;
 /* A disc is reported as it goes in, and can be read once it has spun up: its autorun.inf is tried every half
    second for ten seconds. A disk whose arrival is reported twice is launched once. */
 constexpr int       kLaunchTries = 20;
@@ -123,6 +141,8 @@ enum : UINT {
     IDM_AUTORUN_LABEL,
     IDM_FILE_ICON,
     IDM_VOLUME_LABEL,
+    IDM_SHORTCUTS,
+    IDM_SHORTCUT_LETTERS,
     IDM_STARTUP,
     IDM_EXIT,
     /* The submenus of kinds of drives: each kind plus its number, all of them plus KindCount. */
@@ -139,6 +159,8 @@ struct Settings {
     bool  volumeLabel  = true; /* the volume label, without an autorun.inf label */
     DWORD checkMs     = 2000;
     bool  refreshAll  = false; /* tell Explorer that any icon may have changed, not only the drive's */
+    bool  shortcuts   = false; /* name shortcuts to the drives whose disks' names and icons are shown after them */
+    bool  shortcutLetters = true; /* with the drives' letters in the names */
     /* The kinds of drives, a bit each: whose disks' names and icons are shown, whose autorun.inf programs are
        started, whose native handling by Windows' AutoPlay is turned off, and whose drives that describe
        themselves are asked whether a disk is in. */
@@ -188,6 +210,13 @@ struct Drive {
     /* What the letter's key gives Explorer. */
     std::wstring shownLabel;
     std::wstring shownIcon;
+
+    /* Explorer's name and icon for the drive, which shortcuts to it show, as the shell gave them last; whether the
+       shell is being asked, and whether it is to be asked again then, as they may have changed meanwhile. */
+    std::wstring shellName;
+    std::wstring shellIcon; /* "file,index", or nothing */
+    bool         naming    = false;
+    bool         nameAgain = false;
 };
 
 /* What a letter's drive was found to be, kept while the letter names the same device. */
@@ -200,7 +229,7 @@ struct Seen {
 };
 
 struct Job {
-    enum Kind { Check, Read, Quit } kind;
+    enum Kind { Check, Read, Name, Quit } kind;
     wchar_t  letter;
     unsigned gen;
 };
@@ -219,6 +248,16 @@ struct Result {
     std::wstring autorunLabel;
     std::wstring autorunIcon;
     std::wstring fileIcon;
+    std::wstring name; /* Explorer's name for the drive */
+    std::wstring icon; /* and its icon, "file,index" */
+};
+
+/* A shortcut to a drive's root, in one of the folders whose shortcuts are named, with its file's identity. */
+struct Shortcut {
+    std::wstring folder;
+    std::wstring file;
+    wchar_t      letter;
+    std::wstring id;
 };
 
 HWND               g_hwnd;
@@ -236,6 +275,12 @@ CRITICAL_SECTION   g_jobLock;
 std::deque<Job>    g_jobs;
 HANDLE             g_jobEvent;
 HANDLE             g_worker;
+/* The folders whose shortcuts to drives are named, the shortcuts to drives found in them last, the shell's
+   notifications of changes in them, and what was logged last of each shortcut, by its path. */
+std::vector<std::wstring> g_shortcutFolders;
+std::vector<Shortcut>     g_shortcuts;
+std::vector<ULONG>        g_watches;
+Pairs                     g_notes;
 
 void
 Log(const wchar_t *fmt, ...)
@@ -287,6 +332,37 @@ WriteSetting(const wchar_t *name, const DWORD v)
     (void) RegSetKeyValueW(HKEY_CURRENT_USER, kSettings, name, REG_DWORD, &v, sizeof(v));
 }
 
+/* The folders whose shortcuts to drives are named: those that the ShortcutFolders setting lists, or else the
+   desktop's. */
+void
+LoadShortcutFolders()
+{
+    DWORD size    = 0;
+    PWSTR desktop = nullptr;
+
+    g_shortcutFolders.clear();
+    if ((RegGetValueW(HKEY_CURRENT_USER, kSettings, L"ShortcutFolders", RRF_RT_REG_MULTI_SZ, nullptr, nullptr, &size) ==
+         ERROR_SUCCESS) &&
+        (size > 0)) {
+        std::vector<wchar_t> list(size / sizeof(wchar_t) + 2, L'\0');
+        DWORD                got = static_cast<DWORD>(list.size() * sizeof(wchar_t));
+
+        if (RegGetValueW(HKEY_CURRENT_USER, kSettings, L"ShortcutFolders", RRF_RT_REG_MULTI_SZ, nullptr, list.data(),
+                         &got) == ERROR_SUCCESS)
+            for (const wchar_t *p = list.data(); *p != L'\0'; p += wcslen(p) + 1) {
+                std::wstring folder = Trim(p);
+
+                while ((folder.size() > 3) && (folder.back() == L'\\'))
+                    folder.pop_back();
+                if (!folder.empty())
+                    g_shortcutFolders.push_back(folder);
+            }
+    }
+    if (g_shortcutFolders.empty() && SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Desktop, 0, nullptr, &desktop)))
+        g_shortcutFolders.push_back(desktop);
+    CoTaskMemFree(desktop);
+}
+
 void
 LoadSettings()
 {
@@ -296,12 +372,15 @@ LoadSettings()
     g_set.volumeLabel = ReadSetting(L"VolumeLabel", 1) != 0;
     g_set.checkMs     = ReadSetting(L"CheckMs", 2000);
     g_set.refreshAll  = ReadSetting(L"RefreshAll", 0) != 0;
+    g_set.shortcuts   = ReadSetting(L"Shortcuts", 0) != 0;
+    g_set.shortcutLetters = ReadSetting(L"ShortcutLetters", 1) != 0;
     g_set.display     = ReadSetting(L"Display", g_set.display) & kAllKinds;
     g_set.launch      = ReadSetting(L"Launch", 0) & kAllKinds;
     g_set.native      = ReadSetting(L"Native", 0) & kAllKinds;
     g_set.look        = ReadSetting(L"Look", kAllKinds) & kAllKinds;
     if (g_set.checkMs < 500)
         g_set.checkMs = 500;
+    LoadShortcutFolders();
 }
 
 bool
@@ -514,9 +593,28 @@ DoRead(Result &r)
         r.fileIcon = CacheIcon(r.letter, first);
 }
 
+/* Explorer's name and icon for the drive, which shortcuts to it are to show: the shell's, as Explorer shows the
+   drive, the disk's name within it. The shell reads some drives' disks for them, so it is asked here. */
+void
+DoName(Result &r)
+{
+    wchar_t     root[] = L"A:\\";
+    SHFILEINFOW info   = {};
+    SHFILEINFOW where  = {};
+
+    root[0] = r.letter;
+    if (SHGetFileInfoW(root, 0, &info, sizeof(info), SHGFI_DISPLAYNAME) != 0)
+        r.name = info.szDisplayName;
+    if ((SHGetFileInfoW(root, 0, &where, sizeof(where), SHGFI_ICONLOCATION) != 0) && (where.szDisplayName[0] != L'\0'))
+        r.icon = std::wstring(where.szDisplayName) + L"," + std::to_wstring(where.iIcon);
+}
+
 DWORD WINAPI
 Worker(void *)
 {
+    /* The shell, which names the drives, wants COM. */
+    const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+
     for (;;) {
         Job  job = { Job::Quit, 0, 0 };
         bool any;
@@ -533,7 +631,7 @@ Worker(void *)
             continue;
         }
         if (job.kind == Job::Quit)
-            return 0;
+            break;
 
         Result *r = new Result();
         r->kind   = job.kind;
@@ -541,11 +639,16 @@ Worker(void *)
         r->gen    = job.gen;
         if (job.kind == Job::Check)
             DoCheck(*r);
+        else if (job.kind == Job::Name)
+            DoName(*r);
         else
             DoRead(*r);
         if (!PostMessageW(g_hwnd, kResultMessage, 0, reinterpret_cast<LPARAM>(r)))
             delete r;
     }
+    if (SUCCEEDED(com))
+        CoUninitialize();
+    return 0;
 }
 
 void
@@ -567,6 +670,13 @@ KeyOf(const wchar_t letter)
     k += L'\\';
     k += letter;
     return k;
+}
+
+/* Explorer is told that a shortcut changed, so that it draws it again with its icon. */
+void
+NotifyShortcut(const std::wstring &path)
+{
+    SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW | SHCNF_FLUSHNOWAIT, path.c_str(), nullptr);
 }
 
 void
@@ -638,11 +748,38 @@ SetKey(Drive &d, const std::wstring &label, const std::wstring &icon)
         Settle(d);
 }
 
+/* Whether a shortcut that is named links to the drive. */
+bool
+HasShortcuts(const Drive &d)
+{
+    for (const auto &s : g_shortcuts)
+        if (s.letter == d.letter)
+            return true;
+    return false;
+}
+
+/* Explorer's name for the drive, asked of the shell anew, as its key or its disk may have changed it: for a drive
+   that shortcuts to it are named after, unless another program has its volume. A name asked for while the shell
+   is being asked is asked again after it. */
+void
+AskName(Drive &d)
+{
+    if (!g_set.shortcuts || !(g_set.display & (1u << d.kind)) || d.locked || d.held || !HasShortcuts(d))
+        return;
+    if (d.naming) {
+        d.nameAgain = true;
+        return;
+    }
+    d.naming = true;
+    Queue(Job::Name, d.letter, d.gen);
+}
+
 /* The name and icon the settings give the disk: the autorun.inf's label, or else the volume label; the
    autorun.inf's icon, or else the first icon file's, or else Explorer's own; nothing while there is no disk, or
    for a kind of drives the menu does not show disks of. While another program wants the volume locked, or holds
    it, nothing changes, so that Explorer, answering the notification of a change, does not open the volume under
-   the lock; the change waits for the lock to end. */
+   the lock; the change waits for the lock to end. Explorer's name for the drive, which shortcuts to it show, is
+   asked anew. */
 void
 Show(Drive &d)
 {
@@ -662,6 +799,7 @@ Show(Drive &d)
             icon = d.fileIcon;
     }
     SetKey(d, label, icon);
+    AskName(d);
 }
 
 void
@@ -832,6 +970,7 @@ Unregister(Drive &d)
 
 void StartRead(Drive &d);
 bool Watched(const Drive &d);
+void UpdateShortcuts(bool ask);
 
 /* A drive the menu has something to do for. Unless quiet, it came while the program ran, and brought its disk
    with it, as a USB drive does. */
@@ -870,9 +1009,10 @@ AddDrive(const wchar_t letter, const Seen &s, const bool quiet)
         Asked(d)  ? L"asked whether a disk is in" :
         d.reports ? L"Windows tells of its disks" :
                     L"its disk is read when Windows mounts it");
-    /* A floppy drive's disk is read once it is asked or mounted; any other's now. */
+    /* A floppy drive's disk is read once it is asked or mounted; any other's now. Shortcuts to it show its name. */
     if (d.reports)
         StartRead(g_drives.back());
+    AskName(g_drives.back());
 }
 
 void
@@ -886,6 +1026,8 @@ RemoveDrive(const size_t i)
     KillTimer(g_hwnd, kMountTimer + static_cast<UINT>(d.letter - L'A'));
     KillTimer(g_hwnd, kRefreshTimer + static_cast<UINT>(d.letter - L'A'));
     g_drives.erase(g_drives.begin() + static_cast<ptrdiff_t>(i));
+    /* Shortcuts to it get their own names back. */
+    UpdateShortcuts(false);
 }
 
 /* What the letter's drive is, sorted once for each device the letter names. */
@@ -938,6 +1080,344 @@ Scan(const bool quiet = false)
         if (g_seen[i].known && Followed(g_seen[i].kind) && (FindDrive(letter) == nullptr))
             AddDrive(letter, g_seen[i], quiet);
     }
+}
+
+/* Shortcuts to drives. */
+
+/* Logs the line of what is so of a shortcut or a folder, by a key of its own, once until it changes. */
+void
+Note(const std::wstring &key, const std::wstring &line)
+{
+    for (auto &n : g_notes)
+        if (_wcsicmp(n.first.c_str(), key.c_str()) == 0) {
+            if (n.second != line) {
+                n.second = line;
+                Log(L"%ls", line.c_str());
+            }
+            return;
+        }
+    g_notes.push_back({ key, line });
+    Log(L"%ls", line.c_str());
+}
+
+/* What the program keeps of a shortcut it renamed, so that it can give the shortcut its own name and icon back
+   even after it ended without that: by the identity of the shortcut's file, which holds however the file is
+   renamed, its own file name and icon, and where the program saw it last. Each is a value of the kNamed key, named
+   by the identity and holding the other three, each after a '|', which no file's name or path holds. */
+struct Named {
+    std::wstring id;
+    std::wstring name;
+    std::wstring icon; /* "file,index", or nothing for the target's */
+    std::wstring path;
+};
+
+std::vector<Named>
+NamedShortcuts()
+{
+    std::vector<Named> out;
+    HKEY               key = nullptr;
+
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kNamed, 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS)
+        return out;
+    for (DWORD i = 0;; i++) {
+        wchar_t    id[64];
+        wchar_t    data[4096];
+        DWORD      chars = _countof(id);
+        DWORD      size  = sizeof(data) - sizeof(wchar_t);
+        DWORD      type  = 0;
+        const LONG r     = RegEnumValueW(key, i, id, &chars, nullptr, &type, reinterpret_cast<BYTE *>(data), &size);
+
+        if (r == ERROR_NO_MORE_ITEMS)
+            break;
+        if ((r != ERROR_SUCCESS) || (type != REG_SZ))
+            continue;
+        data[size / sizeof(wchar_t)] = L'\0';
+        const std::wstring s     = data;
+        const size_t       one   = s.find(L'|');
+        const size_t       other = (one == std::wstring::npos) ? one : s.find(L'|', one + 1);
+
+        if (other != std::wstring::npos)
+            out.push_back({ id, s.substr(0, one), s.substr(one + 1, other - one - 1), s.substr(other + 1) });
+    }
+    RegCloseKey(key);
+    return out;
+}
+
+void
+Record(const Named &n)
+{
+    const std::wstring data = n.name + L"|" + n.icon + L"|" + n.path;
+
+    (void) RegSetKeyValueW(HKEY_CURRENT_USER, kNamed, n.id.c_str(), REG_SZ, data.c_str(),
+                           static_cast<DWORD>((data.size() + 1) * sizeof(wchar_t)));
+}
+
+/* Drops what the program kept of a shortcut, and the key with the last. */
+void
+Unrecord(const std::wstring &id)
+{
+    HKEY  key    = nullptr;
+    DWORD values = 1;
+
+    (void) RegDeleteKeyValueW(HKEY_CURRENT_USER, kNamed, id.c_str());
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kNamed, 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS)
+        return;
+    (void) RegQueryInfoKeyW(key, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, &values, nullptr, nullptr,
+                            nullptr, nullptr);
+    RegCloseKey(key);
+    if (values == 0)
+        (void) RegDeleteKeyW(HKEY_CURRENT_USER, kNamed);
+}
+
+/* A shortcut's path as its folder and its file's name. */
+void
+SplitPath(const std::wstring &path, std::wstring *folder, std::wstring *file)
+{
+    const size_t slash = path.rfind(L'\\');
+
+    *folder = (slash == std::wstring::npos) ? std::wstring() : path.substr(0, slash);
+    *file   = (slash == std::wstring::npos) ? path : path.substr(slash + 1);
+}
+
+/* Renames the shortcut in its folder to the file name to, as Explorer is told. Returns its new path, or nothing if
+   it could not be renamed, which GetLastError tells why. */
+std::wstring
+RenameShortcut(const std::wstring &path, const std::wstring &to)
+{
+    std::wstring folder;
+    std::wstring file;
+
+    SplitPath(path, &folder, &file);
+    const std::wstring moved = JoinPath(folder, to);
+    if (!MoveFileExW(path.c_str(), moved.c_str(), 0))
+        return L"";
+    SHChangeNotify(SHCNE_RENAMEITEM, SHCNF_PATHW | SHCNF_FLUSHNOWAIT, path.c_str(), moved.c_str());
+    return moved;
+}
+
+/* Where the shortcut the program renamed is now: where the program saw it last, or wherever in the folders a file
+   of its identity is, as when someone renamed it meanwhile; nothing if it is gone. */
+std::wstring
+WhereIs(const Named &n)
+{
+    if (FileIdentity(n.path) == n.id)
+        return n.path;
+    for (const auto &folder : g_shortcutFolders)
+        for (const auto &file : ShortcutFiles(folder)) {
+            const std::wstring path = JoinPath(folder, file);
+
+            if (FileIdentity(path) == n.id)
+                return path;
+        }
+    return L"";
+}
+
+/* Gives a shortcut that the program renamed its own name and icon back: the name it had, or one after it, as
+   "Name (2)", if another file has that name now. A shortcut that is gone has nothing to be given back. */
+void
+TakeBack(const Named &n)
+{
+    std::wstring path = WhereIs(n);
+
+    if (!path.empty()) {
+        std::wstring folder;
+        std::wstring file;
+
+        SplitPath(path, &folder, &file);
+        if ((ShortcutIcon(path) != n.icon) && !SetShortcutIcon(path, n.icon))
+            Note(L"icon " + path, L"the shortcut '" + path + L"' cannot have its own icon back (error " +
+                                      std::to_wstring(GetLastError()) + L")");
+        const std::wstring name = FreeFileName(folder, n.name, file);
+        if (name != file) {
+            const std::wstring moved = RenameShortcut(path, name);
+
+            if (moved.empty())
+                Note(path, L"the shortcut '" + path + L"' cannot have its own name back (error " +
+                               std::to_wstring(GetLastError()) + L")");
+            else
+                path = moved;
+        }
+        NotifyShortcut(path);
+        Note(path, L"the shortcut '" + path + L"' has its own name and icon again");
+    }
+    Unrecord(n.id);
+}
+
+/* Whether shortcuts to the drive are named after it: to a drive whose disks' names and icons the menu shows. */
+bool
+NamesShortcuts(const Drive *d)
+{
+    return (d != nullptr) && (g_set.display & (1u << d->kind));
+}
+
+/* The shortcuts to drives' roots in the folders whose shortcuts are named, found afresh. */
+void
+FindShortcuts()
+{
+    g_shortcuts.clear();
+    for (const auto &folder : g_shortcutFolders) {
+        const DWORD a = GetFileAttributesW(folder.c_str());
+
+        if ((a == INVALID_FILE_ATTRIBUTES) || !(a & FILE_ATTRIBUTE_DIRECTORY)) {
+            Note(folder, L"there is no folder '" + folder + L"' of shortcuts to drives");
+            continue;
+        }
+        Note(folder, L"shortcuts to drives in '" + folder + L"' are named after their drives");
+        for (const auto &file : ShortcutFiles(folder)) {
+            const std::wstring path   = JoinPath(folder, file);
+            const wchar_t      letter = ShortcutDrive(path);
+
+            if (letter == 0)
+                continue;
+            g_shortcuts.push_back({ folder, file, letter, FileIdentity(path) });
+            /* Noted apart from what the shortcut shows, which is noted by its path alone. */
+            Note(L"link " + path, L"the shortcut '" + path + L"' links to " + letter + L":");
+        }
+    }
+}
+
+/* The names and icons of the shortcuts to drives. While the menu names them, each shortcut to a drive whose disks'
+   names and icons are shown is renamed after Explorer's name for the drive, with the drive's letter or without it
+   as the menu chooses, and given the drive's icon, which Explorer then takes from the shortcut itself rather than
+   from the drive. One to a drive whose volume another program has keeps what it has until the program lets the
+   volume go. Every other shortcut that the program renamed gets its own name and icon back. The shortcuts are found
+   afresh each time, as the program and others rename them meanwhile, and a name the program gave one must never be
+   taken for its own; with ask, the drives not yet named are asked their names. */
+void
+UpdateShortcuts(const bool ask)
+{
+    const std::vector<Named>  named = NamedShortcuts();
+    std::vector<std::wstring> kept;
+
+    if (g_set.shortcuts) {
+        FindShortcuts();
+        if (ask)
+            for (auto &d : g_drives)
+                if (d.shellName.empty())
+                    AskName(d);
+        for (auto &s : g_shortcuts) {
+            const Drive *d    = FindDrive(s.letter);
+            const Named *had  = nullptr;
+            std::wstring path = JoinPath(s.folder, s.file);
+
+            if (!NamesShortcuts(d))
+                continue;
+            for (const auto &n : named)
+                if (!s.id.empty() && (n.id == s.id))
+                    had = &n;
+            if (d->locked || d->held || d->shellName.empty()) {
+                if (had != nullptr)
+                    kept.push_back(had->id);
+                continue;
+            }
+            if (s.id.empty()) {
+                Note(path, L"the shortcut '" + path + L"' keeps its name, as its file cannot be told from others");
+                continue;
+            }
+            /* What the shortcut had of its own is kept before it is renamed, so that a program that ends meanwhile
+               still gives it back. */
+            Named              n    = (had != nullptr) ? *had : Named{ s.id, s.file, ShortcutIcon(path), path };
+            const std::wstring name = FreeFileName(
+                s.folder, ShortcutName(d->shellName, s.letter, g_set.shortcutLetters) + L".lnk", s.file);
+
+            if (name != s.file) {
+                n.path = JoinPath(s.folder, name);
+                Record(n);
+                const std::wstring moved = RenameShortcut(path, name);
+                if (moved.empty()) {
+                    Note(path, L"the shortcut '" + path + L"' cannot be renamed (error " +
+                                   std::to_wstring(GetLastError()) + L")");
+                    if (had != nullptr) {
+                        Record(*had);
+                        kept.push_back(had->id);
+                    } else
+                        Unrecord(n.id);
+                    continue;
+                }
+                path   = moved;
+                s.file = name;
+            } else if ((had == nullptr) || (had->path != path)) {
+                n.path = path;
+                Record(n);
+            }
+            if (!d->shellIcon.empty() && (ShortcutIcon(path) != d->shellIcon)) {
+                if (SetShortcutIcon(path, d->shellIcon))
+                    NotifyShortcut(path);
+                else
+                    Note(L"icon " + path, L"the shortcut '" + path + L"' cannot have its drive's icon (error " +
+                                              std::to_wstring(GetLastError()) + L")");
+            }
+            Note(path, std::wstring(1, s.letter) + L": the shortcut '" + path + L"' shows '" + d->shellName +
+                           L"' with the icon '" + d->shellIcon + L"'");
+            kept.push_back(n.id);
+        }
+    }
+    for (const auto &n : named) {
+        bool keep = false;
+
+        for (const auto &k : kept)
+            keep = keep || (k == n.id);
+        if (!keep)
+            TakeBack(n);
+    }
+}
+
+/* The shell's notifications of changes in the folders whose shortcuts are named, while the menu names them: of a
+   shortcut made, deleted, renamed or changed there. */
+void
+WatchShortcutFolders(const bool on)
+{
+    for (const ULONG id : g_watches)
+        (void) SHChangeNotifyDeregister(id);
+    g_watches.clear();
+    if (!on)
+        return;
+    for (const auto &folder : g_shortcutFolders) {
+        PIDLIST_ABSOLUTE item = ILCreateFromPathW(folder.c_str());
+        ULONG            id   = 0;
+
+        if (item != nullptr) {
+            const SHChangeNotifyEntry e = { item, FALSE };
+
+            id = SHChangeNotifyRegister(g_hwnd, SHCNRF_ShellLevel | SHCNRF_InterruptLevel | SHCNRF_NewDelivery,
+                                        SHCNE_CREATE | SHCNE_DELETE | SHCNE_RENAMEITEM | SHCNE_UPDATEITEM |
+                                            SHCNE_UPDATEDIR,
+                                        kShortcutMessage, 1, &e);
+            ILFree(item);
+        }
+        if (id != 0)
+            g_watches.push_back(id);
+        else
+            Log(L"no notifications of changes in '%ls'", folder.c_str());
+    }
+}
+
+/* Names the shortcuts to drives after their drives, or no longer, as the menu chooses. */
+void
+SetShortcuts(const bool on)
+{
+    g_set.shortcuts = on;
+    WriteSetting(L"Shortcuts", on);
+    Log(L"shortcuts to drives are %ls", on ? L"named after their drives" : L"left their own names");
+    /* The drives are asked their names afresh when shortcuts are named again. */
+    for (auto &d : g_drives) {
+        d.shellName.clear();
+        d.shellIcon.clear();
+    }
+    WatchShortcutFolders(on);
+    UpdateShortcuts(true);
+    if (!on)
+        g_shortcuts.clear();
+}
+
+/* Names the shortcuts with their drives' letters or without them, as the menu chooses. */
+void
+SetShortcutLetters(const bool on)
+{
+    g_set.shortcutLetters = on;
+    WriteSetting(L"ShortcutLetters", on);
+    Log(L"shortcuts to drives are named %ls their drives' letters", on ? L"with" : L"without");
+    UpdateShortcuts(false);
 }
 
 /* Shift held as a disk goes in skips its autorun.inf, as with AutoRun: a read is started as near to that as the
@@ -1024,13 +1504,33 @@ OnResult(Result *r)
     if (d != nullptr) {
         if (r->kind == Job::Check)
             d->checking = false;
-        else
+        else if (r->kind == Job::Read)
             d->reading = false;
-        /* The drive started again meanwhile. */
-        if (r->gen != d->gen)
+        else
+            d->naming = false;
+        /* The drive started again meanwhile; Explorer's name for it, though, holds whatever it went through. */
+        if ((r->gen != d->gen) && (r->kind != Job::Name))
             d = nullptr;
     }
     if (d == nullptr) {
+        delete r;
+        return;
+    }
+
+    if (r->kind == Job::Name) {
+        /* Not while another program has the volume: shortcuts to the drive keep what they have until it is let go.
+           A drive that went meanwhile has no name. */
+        if (!d->locked && !d->held && !r->name.empty() && ((r->name != d->shellName) || (r->icon != d->shellIcon))) {
+            d->shellName = r->name;
+            d->shellIcon = r->icon;
+            Log(L"%lc: Explorer names the drive '%ls', with the icon '%ls'", d->letter, d->shellName.c_str(),
+                d->shellIcon.c_str());
+            UpdateShortcuts(false);
+        }
+        if (d->nameAgain) {
+            d->nameAgain = false;
+            AskName(*d);
+        }
         delete r;
         return;
     }
@@ -1313,6 +1813,10 @@ Cleanup()
         Unregister(d);
     }
     g_drives.clear();
+    /* The shortcuts' own names and icons back. */
+    WatchShortcutFolders(false);
+    for (const auto &n : NamedShortcuts())
+        TakeBack(n);
 }
 
 /* Windows' AutoPlay, cancelled for the kinds of drives whose native handling the menu turns off. AutoPlay asks
@@ -1510,9 +2014,11 @@ SetKinds(DWORD &kinds, const wchar_t *name, const wchar_t *what, const UINT inde
             list += std::wstring(list.empty() ? L"" : L", ") + kKindNames[k];
     Log(L"%ls: %ls", what, list.empty() ? L"no drives" : list.c_str());
 
-    /* The drives that are followed now, and what they show; the disks in them are not launched. */
+    /* The drives that are followed now, what they show, and what shortcuts to them show; the disks in them are not
+       launched. */
     Scan(true);
     ShowAll();
+    UpdateShortcuts(false);
     RegisterCancel(g_set.native != 0);
 }
 
@@ -1535,6 +2041,12 @@ OnCommand(const UINT cmd)
             break;
         case IDM_VOLUME_LABEL:
             Toggle(g_set.volumeLabel, L"VolumeLabel");
+            break;
+        case IDM_SHORTCUTS:
+            SetShortcuts(!g_set.shortcuts);
+            break;
+        case IDM_SHORTCUT_LETTERS:
+            SetShortcutLetters(!g_set.shortcutLetters);
             break;
         case IDM_STARTUP:
             SetStartsWithWindows(!StartsWithWindows());
@@ -1598,6 +2110,9 @@ ShowMenu(const POINT pt)
                        L"Display first icon on disk (no autorun.inf)");
     (void) AppendMenuW(m, MF_STRING | (g_set.volumeLabel ? MF_CHECKED : 0), IDM_VOLUME_LABEL,
                        L"Display volume label (no autorun.inf label)");
+    (void) AppendMenuW(m, MF_STRING | (g_set.shortcuts ? MF_CHECKED : 0), IDM_SHORTCUTS, L"Update shortcuts to drives");
+    (void) AppendMenuW(m, MF_STRING | (g_set.shortcutLetters ? MF_CHECKED : 0) | (g_set.shortcuts ? 0 : MF_GRAYED),
+                       IDM_SHORTCUT_LETTERS, L"Drive letters in shortcut names");
     (void) AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
 
     AppendKinds(m, L"Launch autorun.inf applications", g_set.launch, IDM_LAUNCH,
@@ -1633,6 +2148,9 @@ WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             /* The disks in the drives now went in before the program started, and are not launched. */
             Scan(true);
             RegisterCancel(g_set.native != 0);
+            /* Names that the program gave shortcuts when it last ran are kept for their drives, or taken back. */
+            WatchShortcutFolders(g_set.shortcuts);
+            UpdateShortcuts(true);
             Tick();
             (void) SetTimer(hwnd, kTimerId, g_set.checkMs, nullptr);
             return 0;
@@ -1655,6 +2173,9 @@ WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             } else if (wp == kScanTimer) {
                 KillTimer(hwnd, wp);
                 Scan();
+            } else if (wp == kShortcutTimer) {
+                KillTimer(hwnd, wp);
+                UpdateShortcuts(true);
             } else
                 Tick();
             return 0;
@@ -1675,6 +2196,18 @@ WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case kResultMessage:
             OnResult(reinterpret_cast<Result *>(lp));
             return 0;
+        case kShortcutMessage: {
+            /* A change in a folder whose shortcuts are named: they are looked at again once it has settled. */
+            PIDLIST_ABSOLUTE *items = nullptr;
+            LONG              event = 0;
+            const HANDLE      lock  = SHChangeNotification_Lock(reinterpret_cast<HANDLE>(wp), static_cast<DWORD>(lp),
+                                                                &items, &event);
+
+            if (lock != nullptr)
+                SHChangeNotification_Unlock(lock);
+            (void) SetTimer(hwnd, kShortcutTimer, kShortcutSettle, nullptr);
+            return 0;
+        }
         case WM_DEVICECHANGE:
             OnDeviceChange(wp, lp);
             return TRUE;
