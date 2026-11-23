@@ -25,6 +25,8 @@ It runs as the current user, needs no administrator rights, and needs Windows 10
 | Display autorun.inf label | Shows the label that the disk's autorun.inf names |
 | Display first icon on disk (no autorun.inf) | Shows the first `.ico` file in the disk's root when no autorun.inf icon is shown |
 | Display volume label (no autorun.inf label) | Shows the volume label when no autorun.inf label is shown |
+| Cache icons per volume | Keeps each disk's icons between reads and runs, so that a disk that comes back unchanged shows its icon at once; off at first |
+| Clear the icon cache | Deletes the icons kept, but those the drives show now |
 | Update shortcuts to drives | Renames shortcuts to drives on the desktop after their drives, as Explorer names the drives, and gives them the drives' icons; off at first |
 | Drive letters in shortcut names | Names the shortcuts with their drives' letters, as "TESTDISK (A꞉)", or, unticked, without them, as "TESTDISK" |
 | Launch autorun.inf applications (submenu) | The kinds of drives whose autorun.inf programs are started |
@@ -45,6 +47,14 @@ the keys it writes with a `RetroRun` value and never changes a key without that 
 disks to `%LOCALAPPDATA%\RetroRun\Icons`. An icon in a program or library (`.exe`, `.dll`, `.icl`, `.cpl`, `.ocx`)
 is kept as an `.ico` file taken out of the program's copy, which is then deleted, so that no program stays there; a
 16-bit program, whose icon cannot be taken out so, stays whole.
+
+The icons are deleted as RetroRun starts, unless **Cache icons per volume** is ticked. Then RetroRun keeps each
+disk's icons, for drives of every kind, and remembers under `HKCU\Software\RetroRun\IconCache` what each came from:
+the volume's serial number and label, its autorun.inf, and the icon file's size and date, which the disk's
+directory tells without the file being read. A disk that comes back with all of these unchanged gets its icon again
+at once, without its icon file being read. That matters most for an icon in a program on a floppy: Windows' malware
+scan reads the whole program as it is opened, which takes seconds. **Clear the icon cache** deletes what is kept,
+but the icons the drives show now.
 
 Explorer reads the disks in drives other than floppy drives itself, and what it finds comes first: the volume
 label before `DefaultLabel`, and a disc's autorun.inf icon and label before both. On those drives RetroRun fills
@@ -124,7 +134,8 @@ by another program until it is let go.
 The settings are DWORD values under `HKCU\Software\RetroRun`, which the menu writes. `Display`, `Launch`,
 `Native` and `Look` hold the ticked kinds of drives as bits: 1 floppy disk drives, 2 SuperDisk drives, 4 USB
 drives, 8 memory cards, 16 other removable disks, 32 CD and DVD drives, 64 external hard drives. `Shortcuts` is 1
-while shortcuts to drives are updated, and `ShortcutLetters` 0 while their names leave the drives' letters out. Three settings have no menu item: `CheckMs`, how often drives are asked
+while shortcuts to drives are updated, and `ShortcutLetters` 0 while their names leave the drives' letters out.
+`CacheIcons` is 1 while icons are kept per volume. Three settings have no menu item: `CheckMs`, how often drives are asked
 whether a disk is in (2000 milliseconds, at least 500); `RefreshAll` (0 or 1), which has Explorer redraw every icon
 instead of only the drive's; and `ShortcutFolders`, a list of folders (`REG_MULTI_SZ`) whose shortcuts to drives are
 updated instead of the desktop's. RetroRun reads them as it starts.

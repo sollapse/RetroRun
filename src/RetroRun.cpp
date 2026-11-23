@@ -13,7 +13,8 @@
  *    The menu turns each of these sources on and off; at first, floppy and SuperDisk drives are chosen. Explorer
  *    reads other drives itself, and what it finds wins over the key: the volume label over DefaultLabel, the
  *    autorun.inf's icon and label over both. There the key only fills a gap, such as the first icon file of a
- *    disc whose autorun.inf names no icon.
+ *    disc whose autorun.inf names no icon. If the menu asks, the icons are kept per volume between reads and runs,
+ *    so that a disk that comes back unchanged gets its icon again without its icon file being read.
  *
  * 2. It starts the program that a disk's autorun.inf names as the disk goes in, as AutoRun once did. Windows now
  *    does that only for CDs and DVDs, through AutoPlay. The program is the shellexecute entry, which may name a
@@ -93,6 +94,8 @@ const wchar_t kCancelValue[] = L"6956C4D3-3AE2-48CA-B6F1-A4388C71EF93";
 /* What the program keeps of the shortcuts it renamed, by their files' identities, so that it gives them their own
    names and icons back even after it ended without that. */
 const wchar_t kNamed[]       = L"Software\\RetroRun\\ShortcutNames";
+/* The icons kept per volume, if the menu asks for it (see CacheIcon). */
+const wchar_t kIconCache[]   = L"Software\\RetroRun\\IconCache";
 
 constexpr UINT   kTrayMessage     = WM_APP + 1;
 constexpr UINT   kResultMessage   = WM_APP + 2;
@@ -146,6 +149,8 @@ enum : UINT {
     IDM_SHORTCUT_LETTERS,
     IDM_STARTUP,
     IDM_EXIT,
+    IDM_CACHE_ICONS,
+    IDM_CLEAR_ICONS,
     /* The submenus of kinds of drives: each kind plus its number, all of them plus KindCount. */
     IDM_DISPLAY = 1100,
     IDM_LAUNCH  = 1200,
@@ -162,6 +167,7 @@ struct Settings {
     bool  refreshAll  = false; /* tell Explorer that any icon may have changed, not only the drive's */
     bool  shortcuts   = false; /* name shortcuts to the drives whose disks' names and icons are shown after them */
     bool  shortcutLetters = true; /* with the drives' letters in the names */
+    bool  cacheIcons  = false; /* keep the disks' icons per volume between reads and runs */
     /* The kinds of drives, a bit each: whose disks' names and icons are shown, whose autorun.inf programs are
        started, whose native handling by Windows' AutoPlay is turned off, and whose drives that describe
        themselves are asked whether a disk is in. */
@@ -233,6 +239,7 @@ struct Job {
     enum Kind { Check, Read, Name, Quit } kind;
     wchar_t  letter;
     unsigned gen;
+    bool     cache; /* whether icons are kept per volume, as the menu had it then */
 };
 
 struct Result {
@@ -376,6 +383,7 @@ LoadSettings()
     g_set.refreshAll  = ReadSetting(L"RefreshAll", 0) != 0;
     g_set.shortcuts   = ReadSetting(L"Shortcuts", 0) != 0;
     g_set.shortcutLetters = ReadSetting(L"ShortcutLetters", 1) != 0;
+    g_set.cacheIcons      = ReadSetting(L"CacheIcons", 0) != 0;
     g_set.display     = ReadSetting(L"Display", g_set.display) & kAllKinds;
     g_set.launch      = ReadSetting(L"Launch", 0) & kAllKinds;
     g_set.native      = ReadSetting(L"Native", 0) & kAllKinds;
@@ -409,13 +417,11 @@ SetStartsWithWindows(const bool on)
                            static_cast<DWORD>((wcslen(exe) + 1) * sizeof(wchar_t)));
 }
 
-/* The program's data: the log, and the icons copied from the disks, under %LOCALAPPDATA%\RetroRun. The icons
-   of before are cleared, since no key points at them any more. */
+/* The program's data: the log, and the icons copied from the disks, under %LOCALAPPDATA%\RetroRun. */
 void
 InitData()
 {
-    PWSTR            base = nullptr;
-    WIN32_FIND_DATAW f;
+    PWSTR base = nullptr;
 
     if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &base)))
         return;
@@ -430,15 +436,200 @@ InitData()
     if (GetFileAttributesExW(log.c_str(), GetFileExInfoStandard, &a) && ((a.nFileSizeHigh != 0) || (a.nFileSizeLow > kLogMax)))
         (void) DeleteFileW(log.c_str());
     g_logPath = log;
+}
 
-    const HANDLE h = FindFirstFileW((g_iconDir + L"\\*").c_str(), &f);
+/* The icon cache. Each disk's icons are copied into it, as Explorer keeps icons by their file and index (see
+   CacheIcon). If the menu asks, they are also kept per volume between reads and runs, as values of the kIconCache
+   key: one for each volume's autorun.inf icon and one for its first icon file, named by the volume's serial number
+   and which icon it is, and holding a hash of what the icon came from with the icon's location in the cache, as
+   "hash|file,index". The hash is of the volume's label, its autorun.inf, the icon as the disk names it, and the icon
+   file's size and time of writing, which the disk's directory tells without the file being opened: a disk that
+   comes back unchanged gets its icon again without its icon file being read, as a program would be, whole, by
+   Windows' malware scan as it is opened. */
+
+/* What tells a volume's icon apart, for what the cache keeps of it. */
+struct VolumeIcon {
+    DWORD          serial;
+    std::wstring   label;
+    uint64_t       infHash;
+    const wchar_t *which; /* L"autorun" or L"file" */
+    bool           cache; /* whether icons are kept per volume */
+};
+
+std::wstring
+KeptName(const VolumeIcon &v)
+{
+    wchar_t name[48];
+
+    swprintf_s(name, L"%08lx-%ls", static_cast<unsigned long>(v.serial), v.which);
+    return name;
+}
+
+/* The hash of what the icon comes from, the icon file as the disk's directory tells of it. */
+uint64_t
+IconKey(const VolumeIcon &v, const std::wstring &spec, const WIN32_FIND_DATAW &f)
+{
+    std::vector<char> data;
+    const auto        add = [&data](const void *p, const size_t n) {
+        const char *const c = static_cast<const char *>(p);
+
+        data.insert(data.end(), c, c + n);
+    };
+
+    add(v.label.c_str(), (v.label.size() + 1) * sizeof(wchar_t));
+    add(&v.infHash, sizeof(v.infHash));
+    add(spec.c_str(), (spec.size() + 1) * sizeof(wchar_t));
+    add(&f.nFileSizeHigh, sizeof(f.nFileSizeHigh));
+    add(&f.nFileSizeLow, sizeof(f.nFileSizeLow));
+    add(&f.ftLastWriteTime, sizeof(f.ftLastWriteTime));
+    return Hash(data);
+}
+
+/* A kept icon's "hash|file,index" as its hash's text and its location. */
+bool
+SplitKept(const std::wstring &data, std::wstring *hash, std::wstring *location)
+{
+    const size_t bar = data.find(L'|');
+
+    if (bar == std::wstring::npos)
+        return false;
+    *hash     = data.substr(0, bar);
+    *location = data.substr(bar + 1);
+    return true;
+}
+
+/* The file of an icon's location, "file,index". */
+std::wstring
+LocationFile(const std::wstring &location)
+{
+    const size_t comma = location.rfind(L',');
+
+    return (comma == std::wstring::npos) ? location : location.substr(0, comma);
+}
+
+/* The icon kept for the volume, if it came from what key tells and its file is still there; or nothing. */
+std::wstring
+KeptIcon(const VolumeIcon &v, const uint64_t key)
+{
+    wchar_t      data[1024];
+    wchar_t      hex[24];
+    DWORD        size = sizeof(data);
+    std::wstring hash;
+    std::wstring location;
+
+    if (RegGetValueW(HKEY_CURRENT_USER, kIconCache, KeptName(v).c_str(), RRF_RT_REG_SZ, nullptr, data, &size) !=
+        ERROR_SUCCESS)
+        return L"";
+    swprintf_s(hex, L"%016llx", static_cast<unsigned long long>(key));
+    if (!SplitKept(data, &hash, &location) || (hash != hex) ||
+        (GetFileAttributesW(LocationFile(location).c_str()) == INVALID_FILE_ATTRIBUTES))
+        return L"";
+    return location;
+}
+
+void
+KeepIcon(const VolumeIcon &v, const uint64_t key, const std::wstring &location)
+{
+    wchar_t hex[24];
+
+    swprintf_s(hex, L"%016llx", static_cast<unsigned long long>(key));
+    const std::wstring data = std::wstring(hex) + L"|" + location;
+    (void) RegSetKeyValueW(HKEY_CURRENT_USER, kIconCache, KeptName(v).c_str(), REG_SZ, data.c_str(),
+                           static_cast<DWORD>((data.size() + 1) * sizeof(wchar_t)));
+}
+
+/* The cache's files, by their paths. */
+std::vector<std::wstring>
+IconFiles()
+{
+    std::vector<std::wstring> files;
+    WIN32_FIND_DATAW          f;
+    const HANDLE              h = FindFirstFileW((g_iconDir + L"\\*").c_str(), &f);
+
     if (h == INVALID_HANDLE_VALUE)
-        return;
+        return files;
     do {
         if (!(f.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
-            (void) DeleteFileW((g_iconDir + L"\\" + f.cFileName).c_str());
+            files.push_back(g_iconDir + L"\\" + f.cFileName);
     } while (FindNextFileW(h, &f));
     FindClose(h);
+    return files;
+}
+
+/* Deletes the cache's files but those in keep. Returns how many went. */
+int
+DeleteIconFiles(const std::vector<std::wstring> &keep)
+{
+    int deleted = 0;
+
+    for (const auto &path : IconFiles()) {
+        bool kept = false;
+
+        for (const auto &k : keep)
+            kept = kept || (_wcsicmp(k.c_str(), path.c_str()) == 0);
+        if (!kept && DeleteFileW(path.c_str()))
+            deleted++;
+    }
+    return deleted;
+}
+
+/* The icon cache as the program starts: emptied, since no key points into it any more, unless icons are kept per
+   volume. Then only what no kept icon names goes, as a file half written, and a kept icon whose file is gone. */
+void
+PruneIcons()
+{
+    std::vector<std::wstring> keep;
+    HKEY                      key = nullptr;
+
+    if (!g_set.cacheIcons) {
+        (void) RegDeleteTreeW(HKEY_CURRENT_USER, kIconCache);
+        (void) DeleteIconFiles(keep);
+        return;
+    }
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kIconCache, 0, KEY_QUERY_VALUE | KEY_SET_VALUE, &key) == ERROR_SUCCESS) {
+        std::vector<std::wstring> gone;
+
+        for (DWORD i = 0;; i++) {
+            wchar_t      name[64];
+            wchar_t      data[1024];
+            DWORD        chars = _countof(name);
+            DWORD        size  = sizeof(data) - sizeof(wchar_t);
+            DWORD        type  = 0;
+            std::wstring hash;
+            std::wstring location;
+            const LONG   r = RegEnumValueW(key, i, name, &chars, nullptr, &type, reinterpret_cast<BYTE *>(data), &size);
+
+            if (r == ERROR_NO_MORE_ITEMS)
+                break;
+            if (r != ERROR_SUCCESS)
+                continue;
+            data[size / sizeof(wchar_t)] = L'\0';
+            if ((type == REG_SZ) && SplitKept(data, &hash, &location) &&
+                (GetFileAttributesW(LocationFile(location).c_str()) != INVALID_FILE_ATTRIBUTES))
+                keep.push_back(LocationFile(location));
+            else
+                gone.push_back(name);
+        }
+        for (const auto &name : gone)
+            (void) RegDeleteValueW(key, name.c_str());
+        RegCloseKey(key);
+    }
+    (void) DeleteIconFiles(keep);
+}
+
+/* Empties the icon cache, as the menu asks: what it keeps of the volumes, and the files but those that the drives
+   show now or have ready, which the next reads of their disks keep again. */
+void
+ClearIconCache()
+{
+    std::vector<std::wstring> keep;
+
+    for (const auto &d : g_drives)
+        for (const std::wstring *icon : { &d.shownIcon, &d.autorunIcon, &d.fileIcon, &d.shellIcon })
+            if (!icon->empty())
+                keep.push_back(LocationFile(*icon));
+    (void) RegDeleteTreeW(HKEY_CURRENT_USER, kIconCache);
+    Log(L"the icon cache was cleared: %d files deleted", DeleteIconFiles(keep));
 }
 
 /* Reading a disk, on the worker thread. */
@@ -477,10 +668,11 @@ CacheFile(const std::vector<char> &data, const std::wstring &ext)
    disk's icon under another's name. The file is read whole from the disk, once: Windows' malware scan reads a
    program whole as it is opened anyway, into the file cache, which a program loaded in place on the disk would not
    use but read the disk again. A program's icon is then taken out of its copy as an .ico file and the copy
-   deleted, so that the cache keeps no program; one that cannot be loaded so, as a 16-bit program, stays. Returns
-   the icon's location for DefaultIcon, or nothing if the disk has no such icon. */
+   deleted, so that the cache keeps no program; one that cannot be loaded so, as a 16-bit program, stays. If icons
+   are kept per volume, a volume's icon kept from what the disk still has is taken as it is, the file unread.
+   Returns the icon's location for DefaultIcon, or nothing if the disk has no such icon. */
 std::wstring
-CacheIcon(const wchar_t letter, const std::wstring &spec)
+CacheIcon(const wchar_t letter, const std::wstring &spec, const VolumeIcon &volume)
 {
     static const wchar_t *const kTypes[] = { L".ico", L".exe", L".dll", L".icl", L".cpl", L".ocx" };
     std::wstring                file     = spec;
@@ -522,7 +714,23 @@ CacheIcon(const wchar_t letter, const std::wstring &spec)
     }
 
     root[0] = letter;
-    if (!ReadSmallFile(std::wstring(root) + file, kIconMax, data)) {
+    const std::wstring source = std::wstring(root) + file;
+    uint64_t           key    = 0;
+    if (volume.cache) {
+        WIN32_FIND_DATAW found;
+        const HANDLE     h = FindFirstFileW(source.c_str(), &found);
+
+        if (h != INVALID_HANDLE_VALUE) {
+            FindClose(h);
+            key                     = IconKey(volume, spec, found);
+            const std::wstring kept = KeptIcon(volume, key);
+            if (!kept.empty()) {
+                Log(L"%lc: the icon '%ls' is the one kept for the volume", letter, spec.c_str());
+                return kept;
+            }
+        }
+    }
+    if (!ReadSmallFile(source, kIconMax, data)) {
         Log(L"%lc: the icon file '%ls' cannot be read (error %lu)", letter, file.c_str(), GetLastError());
         return L"";
     }
@@ -549,7 +757,10 @@ CacheIcon(const wchar_t letter, const std::wstring &spec)
         Log(L"%lc: '%ls' has no icon %d", letter, file.c_str(), index);
         return L"";
     }
-    return path + L"," + std::to_wstring(index);
+    const std::wstring location = path + L"," + std::to_wstring(index);
+    if (key != 0)
+        KeepIcon(volume, key, location);
+    return location;
 }
 
 /* The first icon file in the disk's root, in the directory's own order. A pattern of "*.ico" also finds a longer
@@ -596,7 +807,7 @@ DoCheck(Result &r)
    that a setting changed later needs no new read; and its serial number and the autorun.inf's hash, which tell
    it from another disk. */
 void
-DoRead(Result &r)
+DoRead(Result &r, const bool cache)
 {
     wchar_t root[]              = L"A:\\";
     wchar_t label[MAX_PATH + 1] = {};
@@ -614,12 +825,12 @@ DoRead(Result &r)
         r.autorunLabel          = Unquote(Value(keys, L"label")).substr(0, kLabelMax);
         const std::wstring icon = Value(keys, L"icon");
         if (!icon.empty())
-            r.autorunIcon = CacheIcon(r.letter, icon);
+            r.autorunIcon = CacheIcon(r.letter, icon, { r.serial, r.volumeLabel, r.infHash, L"autorun", cache });
     }
 
     const std::wstring first = FirstIconFile(r.letter);
     if (!first.empty())
-        r.fileIcon = CacheIcon(r.letter, first);
+        r.fileIcon = CacheIcon(r.letter, first, { r.serial, r.volumeLabel, r.infHash, L"file", cache });
 }
 
 /* Explorer's name and icon for the drive, which shortcuts to it are to show: the shell's, as Explorer shows the
@@ -645,7 +856,7 @@ Worker(void *)
     const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
     for (;;) {
-        Job  job = { Job::Quit, 0, 0 };
+        Job  job = { Job::Quit, 0, 0, false };
         bool any;
 
         EnterCriticalSection(&g_jobLock);
@@ -672,7 +883,7 @@ Worker(void *)
         else if (job.kind == Job::Name)
             DoName(*r);
         else
-            DoRead(*r);
+            DoRead(*r, job.cache);
         r->took = GetTickCount64() - start;
         if (!PostMessageW(g_hwnd, kResultMessage, 0, reinterpret_cast<LPARAM>(r)))
             delete r;
@@ -686,7 +897,7 @@ void
 Queue(const Job::Kind kind, const wchar_t letter, const unsigned gen)
 {
     EnterCriticalSection(&g_jobLock);
-    g_jobs.push_back({ kind, letter, gen });
+    g_jobs.push_back({ kind, letter, gen, g_set.cacheIcons });
     LeaveCriticalSection(&g_jobLock);
     (void) SetEvent(g_jobEvent);
 }
@@ -2080,6 +2291,16 @@ OnCommand(const UINT cmd)
         case IDM_SHORTCUT_LETTERS:
             SetShortcutLetters(!g_set.shortcutLetters);
             break;
+        case IDM_CACHE_ICONS:
+            g_set.cacheIcons = !g_set.cacheIcons;
+            WriteSetting(L"CacheIcons", g_set.cacheIcons);
+            Log(L"icons are %ls", g_set.cacheIcons ? L"kept per volume" : L"no longer kept per volume");
+            if (!g_set.cacheIcons)
+                ClearIconCache();
+            break;
+        case IDM_CLEAR_ICONS:
+            ClearIconCache();
+            break;
         case IDM_STARTUP:
             SetStartsWithWindows(!StartsWithWindows());
             break;
@@ -2142,6 +2363,8 @@ ShowMenu(const POINT pt)
                        L"Display first icon on disk (no autorun.inf)");
     (void) AppendMenuW(m, MF_STRING | (g_set.volumeLabel ? MF_CHECKED : 0), IDM_VOLUME_LABEL,
                        L"Display volume label (no autorun.inf label)");
+    (void) AppendMenuW(m, MF_STRING | (g_set.cacheIcons ? MF_CHECKED : 0), IDM_CACHE_ICONS, L"Cache icons per volume");
+    (void) AppendMenuW(m, MF_STRING, IDM_CLEAR_ICONS, L"Clear the icon cache");
     (void) AppendMenuW(m, MF_STRING | (g_set.shortcuts ? MF_CHECKED : 0), IDM_SHORTCUTS, L"Update shortcuts to drives");
     (void) AppendMenuW(m, MF_STRING | (g_set.shortcutLetters ? MF_CHECKED : 0) | (g_set.shortcuts ? 0 : MF_GRAYED),
                        IDM_SHORTCUT_LETTERS, L"Drive letters in shortcut names");
@@ -2228,6 +2451,10 @@ WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case kResultMessage:
             OnResult(reinterpret_cast<Result *>(lp));
             return 0;
+        case WM_COMMAND:
+            /* The menu's commands, which a script may send as well. */
+            OnCommand(LOWORD(wp));
+            return 0;
         case kShortcutMessage: {
             /* A change in a folder whose shortcuts are named: they are looked at again once it has settled. */
             PIDLIST_ABSOLUTE *items = nullptr;
@@ -2304,6 +2531,7 @@ wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int)
     InitData();
     LoadSettings();
     Log(L"started");
+    PruneIcons();
     /* The program's own icon, at the size of the tray's icons on the screen's scale. */
     const UINT dpi = GetDpiForSystem();
     g_trayIcon     = static_cast<HICON>(LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON,
