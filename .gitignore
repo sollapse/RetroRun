@@ -1,0 +1,8 @@
+# Build trees: the presets build into build/, Visual Studio's own CMake settings into out/.
+/build/
+/out/
+
+# Per-user state of Visual Studio and of CMake.
+/.vs/
+*.user
+CMakeUserPresets.json
