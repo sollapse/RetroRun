@@ -54,6 +54,7 @@
  * drive never holds up the tray icon.
  */
 #include "drives.h"
+#include "icons.h"
 #include "inf.h"
 #include "launch.h"
 #include "shortcuts.h"
@@ -250,6 +251,7 @@ struct Result {
     std::wstring fileIcon;
     std::wstring name; /* Explorer's name for the drive */
     std::wstring icon; /* and its icon, "file,index" */
+    ULONGLONG    took = 0; /* how long the job took, in milliseconds */
 };
 
 /* A shortcut to a drive's root, in one of the folders whose shortcuts are named, with its file's identity. */
@@ -441,10 +443,42 @@ InitData()
 
 /* Reading a disk, on the worker thread. */
 
-/* An icon on the disk, "file[,index]" as an autorun.inf names one: a file of the disk itself, copied to the cache
+/* The bytes as a file of the cache, named by their hash with the extension, made unless it is there already.
+   Returns its path, or nothing if it cannot be made. */
+std::wstring
+CacheFile(const std::vector<char> &data, const std::wstring &ext)
+{
+    wchar_t name[40];
+
+    swprintf_s(name, L"%016llx", static_cast<unsigned long long>(Hash(data)));
+    const std::wstring path = g_iconDir + L"\\" + name + ext;
+    if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        const std::wstring part  = path + L".part";
+        const HANDLE       h     = CreateFileW(part.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                               FILE_ATTRIBUTE_NORMAL, nullptr);
+        DWORD              wrote = 0;
+
+        if (h == INVALID_HANDLE_VALUE)
+            return L"";
+        const bool ok = data.empty() ||
+                        (WriteFile(h, data.data(), static_cast<DWORD>(data.size()), &wrote, nullptr) &&
+                         (wrote == data.size()));
+        CloseHandle(h);
+        if (!ok || !MoveFileExW(part.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            (void) DeleteFileW(part.c_str());
+            return L"";
+        }
+    }
+    return path;
+}
+
+/* An icon on the disk, "file[,index]" as an autorun.inf names one: a file of the disk itself, kept in the cache
    under a name its contents give, as Explorer keeps icons by their file and index and so must never meet one
-   disk's icon under another's name. Returns its location for DefaultIcon, or nothing if the disk has no such
-   icon. */
+   disk's icon under another's name. The file is read whole from the disk, once: Windows' malware scan reads a
+   program whole as it is opened anyway, into the file cache, which a program loaded in place on the disk would not
+   use but read the disk again. A program's icon is then taken out of its copy as an .ico file and the copy
+   deleted, so that the cache keeps no program; one that cannot be loaded so, as a 16-bit program, stays. Returns
+   the icon's location for DefaultIcon, or nothing if the disk has no such icon. */
 std::wstring
 CacheIcon(const wchar_t letter, const std::wstring &spec)
 {
@@ -453,7 +487,6 @@ CacheIcon(const wchar_t letter, const std::wstring &spec)
     int                         index    = 0;
     const size_t                comma    = spec.rfind(L',');
     wchar_t                     root[]   = L"A:\\";
-    wchar_t                     name[40];
     std::vector<char>           data;
     bool                        known = false;
 
@@ -493,24 +526,20 @@ CacheIcon(const wchar_t letter, const std::wstring &spec)
         Log(L"%lc: the icon file '%ls' cannot be read (error %lu)", letter, file.c_str(), GetLastError());
         return L"";
     }
+    std::wstring path = CacheFile(data, ext);
+    if (path.empty())
+        return L"";
+    if (ext != L".ico") {
+        std::vector<char> ico;
 
-    swprintf_s(name, L"%016llx", static_cast<unsigned long long>(Hash(data)));
-    const std::wstring path = g_iconDir + L"\\" + name + ext;
-    if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        const std::wstring part  = path + L".part";
-        const HANDLE       h     = CreateFileW(part.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-                                               FILE_ATTRIBUTE_NORMAL, nullptr);
-        DWORD              wrote = 0;
+        if (ProgramIcon(path, index, &ico)) {
+            const std::wstring icon = CacheFile(ico, L".ico");
 
-        if (h == INVALID_HANDLE_VALUE)
-            return L"";
-        const bool ok = data.empty() ||
-                        (WriteFile(h, data.data(), static_cast<DWORD>(data.size()), &wrote, nullptr) &&
-                         (wrote == data.size()));
-        CloseHandle(h);
-        if (!ok || !MoveFileExW(part.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
-            (void) DeleteFileW(part.c_str());
-            return L"";
+            if (!icon.empty()) {
+                (void) DeleteFileW(path.c_str());
+                path  = icon;
+                index = 0;
+            }
         }
     }
 
@@ -633,16 +662,18 @@ Worker(void *)
         if (job.kind == Job::Quit)
             break;
 
-        Result *r = new Result();
-        r->kind   = job.kind;
-        r->letter = job.letter;
-        r->gen    = job.gen;
+        Result         *r     = new Result();
+        const ULONGLONG start = GetTickCount64();
+        r->kind               = job.kind;
+        r->letter             = job.letter;
+        r->gen                = job.gen;
         if (job.kind == Job::Check)
             DoCheck(*r);
         else if (job.kind == Job::Name)
             DoName(*r);
         else
             DoRead(*r);
+        r->took = GetTickCount64() - start;
         if (!PostMessageW(g_hwnd, kResultMessage, 0, reinterpret_cast<LPARAM>(r)))
             delete r;
     }
@@ -1613,8 +1644,9 @@ OnResult(Result *r)
             d->autorunLabel = r->autorunLabel;
             d->autorunIcon  = r->autorunIcon;
             d->fileIcon     = r->fileIcon;
-            Log(L"%lc: a disk labelled '%ls'; autorun.inf label '%ls', icon '%ls'; first icon file '%ls'", d->letter,
-                r->volumeLabel.c_str(), r->autorunLabel.c_str(), r->autorunIcon.c_str(), r->fileIcon.c_str());
+            Log(L"%lc: a disk labelled '%ls'; autorun.inf label '%ls', icon '%ls'; first icon file '%ls'; read in %llu ms",
+                d->letter, r->volumeLabel.c_str(), r->autorunLabel.c_str(), r->autorunIcon.c_str(), r->fileIcon.c_str(),
+                static_cast<unsigned long long>(r->took));
         } else {
             /* Nothing to show: no disk; a disk that Windows cannot read; or, as an empty drive's volume answers
                just after it was let go, a parameter error, which says neither. */

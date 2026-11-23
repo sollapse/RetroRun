@@ -42,7 +42,9 @@ disks" item ticks them all, or unticks them all when all are ticked.
 RetroRun gives Explorer what it found through the drive letter's per-user key,
 `HKCU\Software\Classes\Applications\Explorer.exe\Drives\<letter>` (`DefaultLabel` and `DefaultIcon`). It marks
 the keys it writes with a `RetroRun` value and never changes a key without that mark. Icons are copied from the
-disks to `%LOCALAPPDATA%\RetroRun\Icons`.
+disks to `%LOCALAPPDATA%\RetroRun\Icons`. An icon in a program or library (`.exe`, `.dll`, `.icl`, `.cpl`, `.ocx`)
+is kept as an `.ico` file taken out of the program's copy, which is then deleted, so that no program stays there; a
+16-bit program, whose icon cannot be taken out so, stays whole.
 
 Explorer reads the disks in drives other than floppy drives itself, and what it finds comes first: the volume
 label before `DefaultLabel`, and a disc's autorun.inf icon and label before both. On those drives RetroRun fills

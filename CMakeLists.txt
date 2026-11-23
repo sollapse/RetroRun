@@ -33,10 +33,11 @@ if(MINGW)
   target_link_options(retrorun_options INTERFACE -municode -static)
 endif()
 
-# Reading disks, autorun.inf files and the programs they name, and naming shortcuts to drives: shared by the
-# program and its tests.
+# Reading disks, autorun.inf files, the programs they name and the icons in programs, and naming shortcuts to
+# drives: shared by the program and its tests.
 add_library(retrorun_core STATIC
   src/drives.cpp src/drives.h
+  src/icons.cpp src/icons.h
   src/inf.cpp src/inf.h
   src/launch.cpp src/launch.h
   src/shortcuts.cpp src/shortcuts.h)
@@ -65,4 +66,8 @@ if(RETRORUN_BUILD_TESTS)
   add_executable(shortcuts-test tests/shortcuts-test.cpp)
   target_link_libraries(shortcuts-test PRIVATE retrorun_core)
   add_test(NAME shortcuts-test COMMAND shortcuts-test)
+  # The icons are drawn to be compared, which takes GDI.
+  add_executable(icons-test tests/icons-test.cpp)
+  target_link_libraries(icons-test PRIVATE retrorun_core gdi32)
+  add_test(NAME icons-test COMMAND icons-test)
 endif()
